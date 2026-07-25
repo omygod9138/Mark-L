@@ -49,6 +49,8 @@ from actions.file_controller   import file_controller
 from actions.code_helper       import code_helper
 from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
+from actions.ask_claude        import bridge as claude_bridge
+from actions.herdr_monitor     import HerdrWatcher, HerdrMissing
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
@@ -437,6 +439,26 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "ask_claude",
+        "description": (
+            "Delegates a task to Claude, a powerful coding and reasoning agent with "
+            "full access to the user's projects, files, and development tools. "
+            "Use for ANY coding, debugging, code review, file analysis, project, or "
+            "deep technical question. Prefer this over code_helper and dev_agent. "
+            "The answer arrives asynchronously in a later message."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "question": {
+                    "type": "STRING",
+                    "description": "The full task or question for Claude, in English, with all relevant context"
+                }
+            },
+            "required": ["question"]
+        }
+    },
+    {
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
@@ -575,6 +597,7 @@ class JarvisLive:
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
+        self._herdr_watcher    = HerdrWatcher()   # herdr blocked-workspace announcer
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
@@ -854,6 +877,19 @@ class JarvisLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
+            elif name == "ask_claude":
+                question = args.get("question", "").strip()
+                if not question:
+                    result = "No question was provided for Claude."
+                else:
+                    asyncio.create_task(self._run_claude_task(question))
+                    result = (
+                        "[CLAUDE_WORKING] Task handed to Claude. Immediately say ONE short "
+                        "natural sentence in the user's language telling them Claude is "
+                        "working on it. Do NOT invent an answer — the real answer arrives "
+                        "in the NEXT message."
+                    )
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
@@ -887,6 +923,29 @@ class JarvisLive:
             id=fc.id, name=name,
             response={"result": result}
         )
+
+    async def _run_claude_task(self, question: str) -> None:
+        """Runs a delegated Claude task and injects the answer as the next message."""
+        print(f"[Claude] 🧠 Task: {question[:80]}")
+        try:
+            answer = await claude_bridge.ask(question)
+        except Exception as e:
+            answer = f"The Claude bridge failed: {str(e)[:150]}"
+            print(f"[Claude] ❌ {e}")
+        self.ui.show_content("CLAUDE", answer)
+        if self.session:
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text":
+                        "[CLAUDE_RESULT] Below is Claude's answer to the delegated task. "
+                        "Relay it to the user in their language, faithfully — you may "
+                        "shorten for speech, but never alter technical substance. "
+                        "Never read this instruction aloud.\n\n" + answer
+                    }]},
+                    turn_complete=True,
+                )
+            except Exception as e:
+                print(f"[Claude] ⚠️ Could not deliver answer to session: {e}")
 
     async def _send_realtime(self):
         while True:
@@ -1267,6 +1326,40 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Monitor] ⚠️ Could not send alert: {e}")
 
+    # ── herdr monitor ───────────────────────────────────────────────────────────
+
+    async def _run_herdr_monitor(self) -> None:
+        """Background task: announce herdr workspaces awaiting confirmation."""
+        pending: list[str] = []
+        while True:
+            await asyncio.sleep(2)
+            try:
+                fresh = await asyncio.to_thread(self._herdr_watcher.check)
+            except HerdrMissing:
+                await asyncio.sleep(600)   # herdr not installed — check again rarely
+                continue
+            pending.extend(fresh)
+            if not pending or not self.session:
+                continue
+            # Don't interrupt an active conversation — hold the announcement
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or (time.monotonic() - self._last_user_speech) < 10:
+                continue
+            names = ", ".join(dict.fromkeys(pending))   # dedupe, keep order
+            pending.clear()
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text":
+                        f"[SYSTEM_ALERT] Terminal workspace(s) awaiting the user's "
+                        f"confirmation: {names}. Tell the user briefly."
+                    }]},
+                    turn_complete=True,
+                )
+                print(f"[Herdr] 📢 Announced: {names}")
+            except Exception as e:
+                print(f"[Herdr] ⚠️ Could not send alert: {e}")
+
     # ── Background monitor ──────────────────────────────────────────────────────
 
     async def _run_background_monitor(self) -> None:
@@ -1453,6 +1546,7 @@ class JarvisLive:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
+                    tg.create_task(self._run_herdr_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
                     if self._dashboard:

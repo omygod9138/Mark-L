@@ -1,0 +1,8 @@
+# Secrets & personal data
+config/api_keys.json
+memory/long_term.json
+
+# Environment & caches
+.venv/
+__pycache__/
+*.pyc
