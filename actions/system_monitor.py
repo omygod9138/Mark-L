@@ -15,10 +15,14 @@ DEFAULT_THRESHOLDS = {
     "ram":  90.0,
     "temp": 85.0,
     "gpu":  95.0,
+    "disk": 90.0,
 }
 
-_COOLDOWN   = 300
-_CPU_STREAK = 3
+_COOLDOWN      = 300
+_DISK_COOLDOWN = 21600   # a full disk stays full — don't nag every 5 minutes
+_CPU_STREAK    = 3
+
+_DISK_PATH = "C:\\" if _OS == "Windows" else "/"
 
 # ── NVML DLL cache (Windows: nvml.dll, Linux: libnvidia-ml.so.1) ─────────────
 _nvml_lib: object = None
@@ -122,9 +126,13 @@ def get_system_status() -> dict:
     uptime_h    = int(uptime_secs // 3600)
     uptime_m    = int((uptime_secs % 3600) // 60)
 
+    disk = psutil.disk_usage(_DISK_PATH)
+
     return {
         "cpu_percent":   round(cpu, 1),
         "ram_percent":   round(ram.percent, 1),
+        "disk_percent":  round(disk.percent, 1),
+        "disk_free_gb":  round(disk.free / 1024 ** 3, 1),
         "ram_used_gb":   round(ram.used   / 1024 ** 3, 1),
         "ram_total_gb":  round(ram.total  / 1024 ** 3, 1),
         "cpu_temp_c":    round(temp, 1) if temp > 0 else None,
@@ -145,8 +153,8 @@ class SystemMonitor:
         self._last_alert: dict[str, float] = {}
         self._cpu_streak  = 0
 
-    def _can_alert(self, key: str) -> bool:
-        return (time.monotonic() - self._last_alert.get(key, 0)) > _COOLDOWN
+    def _can_alert(self, key: str, cooldown: float = _COOLDOWN) -> bool:
+        return (time.monotonic() - self._last_alert.get(key, 0)) > cooldown
 
     def _record(self, key: str):
         self._last_alert[key] = time.monotonic()
@@ -196,5 +204,17 @@ class SystemMonitor:
                 "Briefly inform the user in their language."
             )
             self._record("gpu")
+
+        try:
+            disk = psutil.disk_usage(_DISK_PATH)
+            if disk.percent >= self.thresholds["disk"] and self._can_alert("disk", _DISK_COOLDOWN):
+                alerts.append(
+                    f"[SYSTEM_ALERT] Disk is {disk.percent:.0f}% full — "
+                    f"{disk.free / 1024 ** 3:.0f} GB free. Warn the user in their "
+                    "language and suggest clearing space."
+                )
+                self._record("disk")
+        except Exception:
+            pass
 
         return " ".join(alerts) if alerts else None
