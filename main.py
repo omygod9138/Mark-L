@@ -1151,6 +1151,23 @@ class JarvisLive:
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _read_chronos_tasks() -> str:
+        """Active-task tables of the Chronos index + todo count, raw markdown."""
+        # ponytail: raw slice, Gemini does the summarising — no parser.
+        # Active sections only: the Todo backlog alone can exceed the cap.
+        try:
+            text  = (Path.home() / ".claude" / "tasks" / "TASKS.md").read_text(encoding="utf-8")
+            start = text.find("## Active")
+            if start == -1:
+                return ""
+            end    = text.find("## Done")
+            active = text[start:end if end != -1 else len(text)].strip()[:3500]
+            todos  = text.count("\n- [ ]")
+            return f"(Backlog: {todos} queued todos.)\n{active}"
+        except Exception:
+            return ""
+
     async def _send_startup_briefing(self) -> None:
         """
         Two-phase briefing optimized for speed:
@@ -1259,11 +1276,45 @@ class JarvisLive:
                         f"Let the user know briefly.{lang_str}"
                     )
 
+                if self._turn_done_event:
+                    self._turn_done_event.clear()
+
                 await self.session.send_client_content(
                     turns={"parts": [{"text": p2}]},
                     turn_complete=True,
                 )
                 self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
+
+                # ── Phase 3: task briefing — its own turn so it lands as a
+                # distinct section instead of blurring into the news audio.
+                tasks_md = self._read_chronos_tasks()
+                if not tasks_md:
+                    return
+                if self._turn_done_event:
+                    try:
+                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        pass
+                await asyncio.sleep(1.0)   # turn_complete ≠ playback done — let phase 2 audio finish
+                if not self.session:
+                    return
+
+                p3 = (
+                    "[TASK BRIEFING] The user's task tracker index:\n"
+                    f"{tasks_md}\n\n"
+                    "Deliver this as its own section: open with a short spoken transition "
+                    "(e.g. 'Now, on to your tasks'), then say how many dev and general "
+                    "tasks are active. Then, for the most recently touched task only, name "
+                    "it first — its project tag and a short title — and only then give its "
+                    "'Resume At' hint, rephrased in plain words. Never speak a hint without "
+                    "naming which task it belongs to. Do not read the whole list out loud. "
+                    f"Do not call any tools.{lang_str}"
+                )
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": p3}]},
+                    turn_complete=True,
+                )
+                self.ui.write_log("SYS: Briefing phase 3 (tasks) sent.")
             except Exception as e:
                 print(f"[Briefing] Phase 2 error: {e}")
                 self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
