@@ -1351,8 +1351,8 @@ class JarvisLive:
             try:
                 await self.session.send_client_content(
                     turns={"parts": [{"text":
-                        f"[SYSTEM_ALERT] Terminal workspace(s) awaiting the user's "
-                        f"confirmation: {names}. Tell the user briefly."
+                        f'[QUIET_NOTICE] "Sir, {names} needs your '
+                        f'confirmation."'
                     }]},
                     turn_complete=True,
                 )
