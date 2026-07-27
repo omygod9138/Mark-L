@@ -89,3 +89,41 @@ def save_brief_enabled(enabled: bool) -> None:
             data = {}
     data["morning_brief_enabled"] = enabled
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_widget_mode_enabled() -> bool:
+    return load_api_keys().get("widget_mode_enabled", False)
+
+
+def save_widget_mode_enabled(enabled: bool) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["widget_mode_enabled"] = enabled
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_widget_pos() -> tuple[int, int] | None:
+    pos = load_api_keys().get("widget_pos")
+    if isinstance(pos, list) and len(pos) == 2:
+        try:
+            return (int(pos[0]), int(pos[1]))
+        except Exception:
+            return None
+    return None
+
+
+def save_widget_pos(x: int, y: int) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["widget_pos"] = [x, y]
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")

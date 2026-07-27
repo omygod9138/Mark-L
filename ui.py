@@ -19,17 +19,17 @@ else:
     _WIN_HIDE: dict = {}
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
+    QEasingCurve, QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QFontDatabase, QFontMetrics, QKeySequence, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QMainWindow, QMenu, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
 
@@ -218,9 +218,10 @@ class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
         self.mem  = 0.0
-        self.net  = 0.0   
-        self.gpu  = -1.0  
-        self.tmp  = -1.0  
+        self.net  = 0.0
+        self.gpu  = -1.0
+        self.tmp  = -1.0
+        self.disk_percent = 0.0
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
@@ -256,12 +257,15 @@ class _SysMetrics:
 
         tmp = self._get_temp()
 
+        disk_percent = psutil.disk_usage("/").percent
+
         with self._lock:
             self.cpu = cpu
             self.mem = mem
             self.net = net
             self.gpu = gpu
             self.tmp = tmp
+            self.disk_percent = disk_percent
 
     def _get_gpu(self) -> float:
         # pynvml — subprocess-free, works on all platforms if installed
@@ -332,6 +336,7 @@ class _SysMetrics:
                 "net": self.net,
                 "gpu": self.gpu,
                 "tmp": self.tmp,
+                "disk_percent": self.disk_percent,
             }
 
 
@@ -1767,6 +1772,9 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        self._widget_card: WidgetCard | None = None
+        self._widget_mode_active = False
+        self._really_quit = False
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1856,6 +1864,8 @@ class MainWindow(QMainWindow):
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
+        from memory.config_manager import get_widget_mode_enabled as _gwme
+        self._update_widget_btn(_gwme())
 
         self._clock_tmr = QTimer(self)
         self._clock_tmr.timeout.connect(self._tick_clock)
@@ -1868,7 +1878,7 @@ class MainWindow(QMainWindow):
         self._metric_tmr.start(2000)
         self._update_metrics()
 
-        self._log_sig.connect(self._log.append_log)
+        self._log_sig.connect(self._on_log_line)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -1897,6 +1907,11 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+        sc_widget = QShortcut(QKeySequence("F10"), self)
+        sc_widget.activated.connect(self._toggle_widget)
+
+        if _gwme():
+            QTimer.singleShot(0, self._enter_widget_mode)
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -2710,6 +2725,21 @@ class MainWindow(QMainWindow):
         self._brief_btn.clicked.connect(self._toggle_brief)
         lay.addWidget(self._brief_btn)
 
+        self._widget_btn = QPushButton()
+        self._widget_btn.setFixedHeight(26)
+        self._widget_btn.setFont(QFont("Courier New", 7))
+        self._widget_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._widget_btn.clicked.connect(self._toggle_widget)
+        lay.addWidget(self._widget_btn)
+
+        quit_btn = QPushButton("⏻  QUIT")
+        quit_btn.setFixedHeight(26)
+        quit_btn.setFont(QFont("Courier New", 7))
+        quit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        quit_btn.setStyleSheet(_BTN_STYLE_DIM)
+        quit_btn.clicked.connect(self._real_quit)
+        lay.addWidget(quit_btn)
+
         w.adjustSize()
         return w
 
@@ -3064,6 +3094,84 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
 
+    def _toggle_widget(self):
+        from memory.config_manager import get_widget_mode_enabled, save_widget_mode_enabled
+        new_val = not get_widget_mode_enabled()
+        save_widget_mode_enabled(new_val)
+        self._update_widget_btn(new_val)
+        if new_val:
+            self._enter_widget_mode()
+        else:
+            self._exit_widget_mode()
+
+    def _update_widget_btn(self, enabled: bool):
+        if not hasattr(self, '_widget_btn'):
+            return
+        if enabled:
+            self._widget_btn.setText("◱  WIDGET MODE: ON  [F10]")
+            self._widget_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a08; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ background: #002010; }}
+            """)
+        else:
+            self._widget_btn.setText("◱  WIDGET MODE: OFF  [F10]")
+            self._widget_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_DIM};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+            """)
+
+    # ── Widget mode ──────────────────────────────────────────────────────────────
+
+    def _enter_widget_mode(self):
+        if self._widget_card is None:
+            self._widget_card = WidgetCard(_metrics)
+            self._widget_card.expand_requested.connect(self._exit_widget_mode)
+            self._widget_card.installEventFilter(self)
+        self._widget_mode_active = True
+        self.hide()
+        self._widget_card.show()
+
+    def _exit_widget_mode(self):
+        self._widget_mode_active = False
+        if self._widget_card is not None:
+            self._widget_card.hide()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _real_quit(self):
+        self._really_quit = True
+        QApplication.instance().quit()
+
+    def closeEvent(self, event):
+        if self._really_quit:
+            event.accept()
+            return
+        event.ignore()
+        self._enter_widget_mode()
+
+    def eventFilter(self, obj, event):
+        if self._widget_card is not None and obj is self._widget_card \
+                and event.type() == QEvent.Type.ContextMenu:
+            menu = QMenu(self._widget_card)
+            open_act = menu.addAction("Open HUD")
+            quit_act = menu.addAction("Quit")
+            chosen = menu.exec(event.globalPos())
+            if chosen == open_act:
+                self._exit_widget_mode()
+            elif chosen == quit_act:
+                self._real_quit()
+            return True
+        return super().eventFilter(obj, event)
+
     # ── Customization ────────────────────────────────────────────────────────────
 
     def _open_customize(self):
@@ -3203,6 +3311,16 @@ class MainWindow(QMainWindow):
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        if self._widget_card is not None:
+            self._widget_card.set_state(state)
+
+    def _on_log_line(self, text: str):
+        self._log.append_log(text)
+        if self._widget_card is not None:
+            tl = text.lower()
+            ai_pfx = f"{self._assistant_name.lower()}:"
+            if tl.startswith(ai_pfx) or tl.startswith("jarvis:"):
+                self._widget_card.set_last_line(text)
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -3213,6 +3331,8 @@ class MainWindow(QMainWindow):
             return False
 
     def _show_setup(self):
+        if self._widget_mode_active:
+            self._exit_widget_mode()
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
         ow, oh = 460, 390
@@ -3337,3 +3457,276 @@ class JarvisUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+
+class MiniOrb(QWidget):
+    """Tiny always-on HUD orb for widget mode — rotating ring + pulsing core.
+
+    Vocabulary is deliberately small: `set_state()` drives core colour and
+    ring rotation speed. States are free strings; anything unrecognised
+    falls back to the accent colour.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(56, 56)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._state = "SLEEPING"
+        self._angle = 0.0
+        self._pulse = 0.0
+
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(25)
+
+    def set_state(self, state: str):
+        self._state = (state or "").strip().upper()
+        self.update()
+
+    def _tick(self):
+        speed = {"SPEAKING": 6.0, "LISTENING": 3.0, "SLEEPING": 0.6}.get(self._state, 2.2)
+        self._angle = (self._angle + speed) % 360.0
+        self._pulse = (self._pulse + 0.06) % (2 * math.pi)
+        self.update()
+
+    def _core_color(self) -> QColor:
+        if self._state == "LISTENING":
+            return qcol(C.GREEN)
+        if self._state == "SLEEPING":
+            return qcol(C.TEXT_DIM)
+        return qcol(C.PRI)   # SPEAKING / THINKING / PROCESSING / default
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        cx, cy = W / 2, H / 2
+
+        # rotating ring — 4 arc segments with gaps
+        pen = QPen(qcol(C.PRI, 165), 2)   # ~65% alpha
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        ring_rect = QRectF(4, 4, W - 8, H - 8)
+        span = 60 * 16   # 60° segments, Qt angles are 1/16th-degree units
+        for i in range(4):
+            start = int((self._angle + i * 90) * 16)
+            p.drawArc(ring_rect, start, span)
+
+        # pulsing glow core
+        pulse_scale = 0.85 + 0.15 * math.sin(self._pulse)
+        radius = 10.0 * pulse_scale
+        core = self._core_color()
+
+        glow = QRadialGradient(QPointF(cx, cy), radius * 1.7)
+        bright = QColor(core); bright.setAlpha(230)
+        fade = QColor(core); fade.setAlpha(0)
+        glow.setColorAt(0.0, bright)
+        glow.setColorAt(1.0, fade)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(QPointF(cx, cy), radius * 1.7, radius * 1.7)
+
+        p.setBrush(QBrush(core))
+        p.drawEllipse(QPointF(cx, cy), radius, radius)
+
+
+class WidgetCard(QWidget):
+    """Floating always-on-top compact status card for widget mode (variant B).
+
+    Frameless, translucent glass panel: orb + name/state header, CPU/RAM/DISK
+    metric tiles, and a last-line strip. Draggable (position persisted via
+    `save_widget_pos`); double-click emits `expand_requested` for phase 4 to
+    wire up. Does not own its `_SysMetrics` — it is handed one and polls it.
+    """
+
+    expand_requested = pyqtSignal()
+
+    _CARD_W = 264
+    _MARGIN = 24
+    _THRESH = 90.0
+
+    _STATE_COLORS = {
+        "LISTENING": C.GREEN,
+        "SPEAKING":  C.PRI,
+        "SLEEPING":  C.TEXT_DIM,
+    }
+
+    def __init__(self, metrics, parent=None):
+        super().__init__(parent)
+        self._metrics = metrics
+        self._drag_offset: QPointF | None = None
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnBottomHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
+        self.setFixedWidth(self._CARD_W)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 12)
+        root.setSpacing(10)
+
+        # ── header: orb + name / state ──────────────────────────────────
+        header = QHBoxLayout()
+        header.setSpacing(10)
+
+        self._orb = MiniOrb(self)
+        header.addWidget(self._orb)
+
+        name_col = QVBoxLayout()
+        name_col.setSpacing(2)
+
+        self._name_lbl = QLabel("J.A.R.V.I.S.")
+        name_font = QFont("Segoe UI", 13, QFont.Weight.DemiBold)
+        name_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        self._name_lbl.setFont(name_font)
+        self._name_lbl.setStyleSheet("color: #d4ecf6; background: transparent;")
+        name_col.addWidget(self._name_lbl)
+
+        self._state_lbl = QLabel("● LISTENING")
+        self._state_lbl.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        self._state_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        name_col.addWidget(self._state_lbl)
+
+        header.addLayout(name_col, 1)
+        root.addLayout(header)
+
+        # ── metric tiles: CPU / RAM / DISK ──────────────────────────────
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
+        self._tile_cpu,  self._val_cpu  = self._make_tile("CPU")
+        self._tile_ram,  self._val_ram  = self._make_tile("RAM")
+        self._tile_disk, self._val_disk = self._make_tile("DISK")
+        tiles.addWidget(self._tile_cpu)
+        tiles.addWidget(self._tile_ram)
+        tiles.addWidget(self._tile_disk)
+        root.addLayout(tiles)
+
+        # ── last line ────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: rgba(255,255,255,0.06);")
+        root.addWidget(sep)
+
+        self._last_line = QLabel("")
+        self._last_line.setWordWrap(True)
+        self._last_line.setFont(QFont("Segoe UI", 9))
+        self._last_line.setStyleSheet("color: #6d93a6; background: transparent;")
+        root.addWidget(self._last_line)
+
+        # ── metrics polling ──────────────────────────────────────────────
+        self._metric_tmr = QTimer(self)
+        self._metric_tmr.timeout.connect(self._refresh_metrics)
+        self._metric_tmr.start(2000)
+        self._refresh_metrics()
+
+        self._restore_position()
+
+    # ── construction helpers ────────────────────────────────────────────
+    def _make_tile(self, key: str) -> tuple[QWidget, QLabel]:
+        tile = QWidget(self)
+        tile.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        tile.setFixedHeight(46)
+        tile.setStyleSheet("background: rgba(0,212,255,0.06); border-radius: 9px;")
+
+        lay = QVBoxLayout(tile)
+        lay.setContentsMargins(0, 6, 0, 4)
+        lay.setSpacing(1)
+
+        val_lbl = QLabel("--")
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        val_lbl.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
+        val_lbl.setStyleSheet("color: #d4ecf6; background: transparent;")
+        lay.addWidget(val_lbl)
+
+        key_lbl = QLabel(key)
+        key_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        key_font = QFont("Segoe UI", 9)
+        key_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        key_lbl.setFont(key_font)
+        key_lbl.setStyleSheet("color: #3a5a6b; background: transparent;")
+        lay.addWidget(key_lbl)
+
+        return tile, val_lbl
+
+    def _restore_position(self):
+        from memory.config_manager import get_widget_pos
+        pos = get_widget_pos()
+        if pos is not None:
+            self.move(pos[0], pos[1])
+            return
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.x() + screen.width() - self.width() - self._MARGIN
+        y = screen.y() + self._MARGIN
+        self.move(x, y)
+
+    # ── metrics ──────────────────────────────────────────────────────────
+    def _refresh_metrics(self):
+        snap = self._metrics.snapshot()
+        self._set_tile(self._tile_cpu,  self._val_cpu,  snap.get("cpu", 0.0))
+        self._set_tile(self._tile_ram,  self._val_ram,  snap.get("mem", 0.0))
+        self._set_tile(self._tile_disk, self._val_disk, snap.get("disk_percent", 0.0))
+
+    def _set_tile(self, tile: QWidget, val_lbl: QLabel, pct: float):
+        val_lbl.setText(f"{pct:.0f}%")
+        if pct >= self._THRESH:
+            tile.setStyleSheet("background: rgba(255,107,0,0.09); border-radius: 9px;")
+            val_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent;")
+        else:
+            tile.setStyleSheet("background: rgba(0,212,255,0.06); border-radius: 9px;")
+            val_lbl.setStyleSheet("color: #d4ecf6; background: transparent;")
+
+    # ── public slots (phase-4 wiring) ───────────────────────────────────
+    def set_state(self, state: str):
+        state = (state or "").strip().upper()
+        self._orb.set_state(state)
+        color = self._STATE_COLORS.get(state, C.PRI)
+        self._state_lbl.setText(f"● {state}")
+        self._state_lbl.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def set_last_line(self, text: str):
+        text = (text or "").strip()
+        fm = QFontMetrics(self._last_line.font())
+        avail_w = self._CARD_W - 28   # minus root margins
+        # elidedText is single-line; doubling the width approximates the
+        # ~2-line budget the card has room for before truncating.
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, avail_w * 2)
+        self._last_line.setText(elided)
+
+    # ── drag-to-move ─────────────────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = e.globalPosition().toPoint() - self.pos()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+            self.move(e.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._drag_offset is not None:
+            self._drag_offset = None
+            from memory.config_manager import save_widget_pos
+            pos = self.pos()
+            save_widget_pos(pos.x(), pos.y())
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.expand_requested.emit()
+        super().mouseDoubleClickEvent(e)
+
+    # ── painting ─────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QBrush(qcol("#020e16", 219)))   # rgba(2,14,22,0.86)
+        p.setPen(QPen(qcol(C.PRI, 71), 1))         # rgba(0,212,255,0.28)
+        p.drawRoundedRect(rect, 18, 18)
