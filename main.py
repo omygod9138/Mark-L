@@ -420,7 +420,7 @@ TOOL_DECLARATIONS = [
         "name": "manage_monitor",
         "description": (
             "Add, remove, or list background monitoring topics. "
-            "JARVIS checks these topics once a day and alerts the user when there is a new development. "
+            "Checks these topics once a day and alerts the user when there is a new development. "
             "Use 'add' when the user says 'monitor X', 'track X', 'follow X'. "
             "Use 'remove' when the user says 'stop monitoring X'. "
             "Use 'list' when the user asks what is being monitored. "
@@ -1654,7 +1654,7 @@ class JarvisLive:
 
                     print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    self.ui.write_log(f"SYS: {self._asst_name} online.")
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})

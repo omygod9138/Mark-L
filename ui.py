@@ -340,7 +340,12 @@ class _SysMetrics:
             }
 
 
-_metrics = _SysMetrics()
+# _SysMetrics polls on its own daemon thread (see _loop, ~line 232) regardless
+# of whether .snapshot() is ever called — instantiating it unconditionally
+# would burn a psutil poll every 1.5s for no consumer. The left sidebar used
+# to read it via _update_metrics; that panel is now the TASKS panel and no
+# code calls .snapshot() anymore (grepped repo-wide). Left uninstantiated;
+# construct `_metrics = _SysMetrics()` again if a future feature needs it.
 
 class HudCanvas(QWidget):
     def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
@@ -1732,6 +1737,92 @@ class RemoteKeyOverlay(QWidget):
         self.closed.emit()
 
 
+class QuickPrompt(QWidget):
+    """Spotlight-style quick-prompt popup — F9 (in-app shortcut or global
+    hotkey) summons a single-line input floating above everything, including
+    widget mode where the main window is hidden. Submitted text goes down the
+    same on_text_command path as the main input field / text-command strip.
+
+    Frameless, translucent, always-on-top glass panel styled to match
+    WidgetCard's palette (dark rounded panel, cyan accent border).
+    """
+
+    submitted = pyqtSignal(str)
+
+    _W, _H = 520, 56
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(self._W, self._H)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(20, 8, 20, 8)
+
+        from memory.config_manager import get_display_name
+        name = get_display_name()
+
+        self._edit = QLineEdit(self)
+        self._edit.setPlaceholderText(f"Ask {name}…")
+        self._edit.setFont(QFont("Segoe UI", 13))
+        self._edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: transparent;
+                color: {C.TEXT};
+                border: none;
+            }}
+        """)
+        self._edit.returnPressed.connect(self._submit)
+        self._edit.installEventFilter(self)
+        lay.addWidget(self._edit)
+
+        self._position()
+
+    def _position(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.x() + (screen.width() - self._W) // 2
+        y = screen.y() + int(screen.height() * 0.28)
+        self.move(x, y)
+
+    def show_prompt(self):
+        self._position()
+        self.show()
+        self.activateWindow()
+        self.raise_()
+        self._edit.setFocus()
+        self._edit.selectAll()
+
+    def _submit(self):
+        txt = self._edit.text().strip()
+        self._edit.clear()
+        self.hide()
+        if txt:
+            self.submitted.emit(txt)
+
+    def eventFilter(self, obj, event):
+        if obj is self._edit:
+            if (event.type() == QEvent.Type.KeyPress
+                    and event.key() == Qt.Key.Key_Escape):
+                self.hide()
+                return True
+            if event.type() == QEvent.Type.FocusOut:
+                self.hide()
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setBrush(QBrush(qcol("#020e16", 235)))
+        p.setPen(QPen(qcol(C.PRI, 90), 1))
+        p.drawRoundedRect(rect, 14, 14)
+
+
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
@@ -1741,6 +1832,7 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
+    _quick_prompt_sig = pyqtSignal()         # F9 global hotkey → toggle quick-prompt popup
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1777,6 +1869,7 @@ class MainWindow(QMainWindow):
         self._widget_card: WidgetCard | None = None
         self._widget_mode_active = False
         self._really_quit = False
+        self._quick_prompt: QuickPrompt | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1874,11 +1967,11 @@ class MainWindow(QMainWindow):
         self._clock_tmr.start(1000)
         self._tick_clock()
 
-        # Metrik güncelleme timer'ı
-        self._metric_tmr = QTimer(self)
-        self._metric_tmr.timeout.connect(self._update_metrics)
-        self._metric_tmr.start(2000)
-        self._update_metrics()
+        # Chronos task-panel refresh timer
+        self._tasks_tmr = QTimer(self)
+        self._tasks_tmr.timeout.connect(self._update_tasks)
+        self._tasks_tmr.start(30000)
+        self._update_tasks()
 
         self._log_sig.connect(self._on_log_line)
         self._state_sig.connect(self._apply_state)
@@ -1911,6 +2004,10 @@ class MainWindow(QMainWindow):
         sc_intr.activated.connect(self._do_interrupt)
         sc_widget = QShortcut(QKeySequence("F10"), self)
         sc_widget.activated.connect(self._toggle_widget)
+        sc_quick = QShortcut(QKeySequence("F9"), self)
+        sc_quick.activated.connect(self._toggle_quick_prompt)
+        self._quick_prompt_sig.connect(self._toggle_quick_prompt)
+        self._start_global_hotkey()
 
         if _gwme():
             QTimer.singleShot(0, self._enter_widget_mode)
@@ -2380,55 +2477,33 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
             self._position_quick_drawer()
 
-    def _update_metrics(self):
-        snap = _metrics.snapshot()
-
-        # CPU
-        cpu = snap["cpu"]
-        self._bar_cpu.set_value(cpu, f"{cpu:.0f}%")
-
-        # MEM
-        mem = snap["mem"]
-        self._bar_mem.set_value(mem, f"{mem:.0f}%")
-
-        # NET
-        net = snap["net"]
-        if net < 1.0:
-            net_str = f"{net*1024:.0f}KB/s"
+    def _update_tasks(self):
+        counts = _chronos_counts()
+        if counts is None:
+            self._dev_lbl.setText("DEV --")
+            self._gen_lbl.setText("GEN --")
+            self._todo_lbl.setText("TODO --")
         else:
-            net_str = f"{net:.1f}MB/s"
-        net_pct = min(100, net * 10)  # 10 MB/s = %100
-        self._bar_net.set_value(net_pct, net_str)
+            dev, gen, todo = counts
+            self._dev_lbl.setText(f"DEV {dev}")
+            self._gen_lbl.setText(f"GEN {gen}")
+            self._todo_lbl.setText(f"TODO {todo}")
 
-        # GPU
-        gpu = snap["gpu"]
-        if gpu >= 0:
-            self._bar_gpu.set_value(gpu, f"{gpu:.0f}%")
-        else:
-            self._bar_gpu.set_value(0, "N/A")
+        recent = _chronos_recent()
+        if recent is None:
+            self._task_lbl.setText("No active tasks")
+            self._resume_lbl.setText("")
+            return
 
-        # TMP
-        tmp = snap["tmp"]
-        if tmp >= 0:
-            tmp_pct = min(100, (tmp / 100) * 100)
-            self._bar_tmp.set_value(tmp_pct, f"{tmp:.0f}°C")
-        else:
-            self._bar_tmp.set_value(0, "N/A")
+        task_label, resume_at = recent
+        fm = QFontMetrics(self._task_lbl.font())
+        elided = fm.elidedText(task_label, Qt.TextElideMode.ElideRight, _LEFT_W - 20)
+        self._task_lbl.setText(elided)
 
-        try:
-            boot_t  = psutil.boot_time()
-            elapsed = time.time() - boot_t
-            h = int(elapsed // 3600)
-            m = int((elapsed % 3600) // 60)
-            self._uptime_lbl.setText(f"UP  {h:02d}:{m:02d}")
-        except Exception:
-            self._uptime_lbl.setText("UP  --:--")
-
-        try:
-            proc_count = len(psutil.pids())
-            self._proc_lbl.setText(f"PROC  {proc_count}")
-        except Exception:
-            self._proc_lbl.setText("PROC  --")
+        resume_at = resume_at.strip()
+        if len(resume_at) > 160:
+            resume_at = resume_at[:157] + "..."
+        self._resume_lbl.setText(resume_at)
 
 
     def _build_header(self) -> QWidget:
@@ -2508,22 +2583,28 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(8, 10, 8, 10)
         lay.setSpacing(6)
 
-        hdr = QLabel("◈ SYS MONITOR")
+        hdr = QLabel("◈ TASKS")
         hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
         lay.addWidget(hdr)
         lay.addSpacing(2)
 
-        self._bar_cpu = MetricBar("CPU", C.PRI)
-        self._bar_mem = MetricBar("MEM", C.ACC2)
-        self._bar_net = MetricBar("NET", C.GREEN)
-        self._bar_gpu = MetricBar("GPU", C.ACC)
-        self._bar_tmp = MetricBar("TMP", "#ff6688")
-
-        for bar in [self._bar_cpu, self._bar_mem, self._bar_net,
-                    self._bar_gpu, self._bar_tmp]:
-            lay.addWidget(bar)
+        counts_row = QHBoxLayout()
+        counts_row.setSpacing(4)
+        self._dev_lbl  = QLabel("DEV 0")
+        self._gen_lbl  = QLabel("GEN 0")
+        self._todo_lbl = QLabel("TODO 0")
+        for lbl, col in [(self._dev_lbl, C.PRI), (self._gen_lbl, C.ACC2),
+                         (self._todo_lbl, C.GREEN)]:
+            lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(
+                f"color: {col}; background: {C.PANEL2};"
+                f"border: 1px solid {C.BORDER_A}; border-radius: 3px; padding: 3px;"
+            )
+            counts_row.addWidget(lbl)
+        lay.addLayout(counts_row)
 
         lay.addSpacing(4)
 
@@ -2535,21 +2616,17 @@ class MainWindow(QMainWindow):
         ip_lay.setContentsMargins(6, 5, 6, 5)
         ip_lay.setSpacing(3)
 
-        self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
-        ip_lay.addWidget(self._uptime_lbl)
+        self._task_lbl = QLabel("No active tasks")
+        self._task_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._task_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
+        self._task_lbl.setWordWrap(True)
+        ip_lay.addWidget(self._task_lbl)
 
-        self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Courier New", 8))
-        self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(self._proc_lbl)
-
-        os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
-        os_lbl = QLabel(f"OS  {os_name}")
-        os_lbl.setFont(QFont("Courier New", 8))
-        os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
-        ip_lay.addWidget(os_lbl)
+        self._resume_lbl = QLabel("")
+        self._resume_lbl.setFont(QFont("Courier New", 7))
+        self._resume_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
+        self._resume_lbl.setWordWrap(True)
+        ip_lay.addWidget(self._resume_lbl)
 
         lay.addWidget(info_panel)
         lay.addSpacing(4)
@@ -3135,7 +3212,7 @@ class MainWindow(QMainWindow):
 
     def _enter_widget_mode(self):
         if self._widget_card is None:
-            self._widget_card = WidgetCard(_metrics, self._assistant_name)
+            self._widget_card = WidgetCard(self._assistant_name)
             self._widget_card.expand_requested.connect(self._exit_widget_mode)
             self._widget_card.installEventFilter(self)
         self._widget_mode_active = True
@@ -3313,6 +3390,40 @@ class MainWindow(QMainWindow):
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
+    # ── Quick prompt (F9 / global hotkey) ───────────────────────────────────────
+
+    def _start_global_hotkey(self):
+        """Register F9 as an OS-wide hotkey via pynput so the quick-prompt
+        popup can be summoned even when the app isn't focused (widget mode).
+        macOS requires Input Monitoring permission for the Python process —
+        absence of it (or of pynput itself) must never crash the app, just
+        print one hint line and carry on with the in-app QShortcut fallback."""
+        try:
+            from pynput import keyboard
+            self._hotkey_listener = keyboard.GlobalHotKeys({
+                '<f9>': lambda: self._quick_prompt_sig.emit()
+            })
+            self._hotkey_listener.daemon = True
+            self._hotkey_listener.start()
+        except Exception as e:
+            print(f"[UI] ⚠️ Global hotkey unavailable (grant Input Monitoring to Python in System Settings): {e}")
+
+    def _toggle_quick_prompt(self):
+        if self._quick_prompt is None:
+            self._quick_prompt = QuickPrompt()
+            self._quick_prompt.submitted.connect(self._on_quick_prompt_submitted)
+        if self._quick_prompt.isVisible():
+            self._quick_prompt.hide()
+        else:
+            self._quick_prompt.show_prompt()
+
+    def _on_quick_prompt_submitted(self, txt: str):
+        txt = txt.strip()
+        if not txt: return
+        self._log.append_log(f"You: {txt}")
+        if self.on_text_command:
+            threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
+
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
@@ -3470,11 +3581,15 @@ class JarvisUI:
 
 
 class MiniOrb(QWidget):
-    """Tiny always-on HUD orb for widget mode — rotating ring + pulsing core.
+    """Tiny always-on HUD orb for widget mode — a scaled-down HudCanvas.
 
-    Vocabulary is deliberately small: `set_state()` drives core colour and
-    ring rotation speed. States are free strings; anything unrecognised
-    falls back to the accent colour.
+    Vocabulary is deliberately small: `set_state()` drives core colour, ring
+    speed and breathing amplitude. States are free strings; anything
+    unrecognised falls back to the accent colour / normal-speed animation.
+    Ported from HudCanvas (~line 345): three counter-rotating ring layers,
+    a sine-breathing halo, a core that gentle-pulses at idle and does
+    speaking-style scale jumps, and expanding pulse rings. Kept at the
+    original 25ms timer and 56x56 size.
     """
 
     def __init__(self, parent=None):
@@ -3482,8 +3597,14 @@ class MiniOrb(QWidget):
         self.setFixedSize(56, 56)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._state = "SLEEPING"
-        self._angle = 0.0
-        self._pulse = 0.0
+
+        self._rings      = [0.0, 0.0, 0.0]   # per-layer rotation angle
+        self._scale       = 1.0              # core scale (gentle / speaking-jump)
+        self._tgt_scale   = 1.0
+        self._last_t      = time.time()
+        self._breath      = 0.0              # halo breathing phase
+        self._pulse       = 0.0              # gentle idle core pulse phase
+        self._pulses: list[float] = []       # expanding pulse-ring radii (max 2)
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._tick)
@@ -3493,12 +3614,6 @@ class MiniOrb(QWidget):
         self._state = (state or "").strip().upper()
         self.update()
 
-    def _tick(self):
-        speed = {"SPEAKING": 6.0, "LISTENING": 3.0, "SLEEPING": 0.6}.get(self._state, 2.2)
-        self._angle = (self._angle + speed) % 360.0
-        self._pulse = (self._pulse + 0.06) % (2 * math.pi)
-        self.update()
-
     def _core_color(self) -> QColor:
         if self._state == "LISTENING":
             return qcol(C.GREEN)
@@ -3506,27 +3621,102 @@ class MiniOrb(QWidget):
             return qcol(C.TEXT_DIM)
         return qcol(C.PRI)   # SPEAKING / THINKING / PROCESSING / default
 
+    def _tick(self):
+        speaking = self._state == "SPEAKING"
+        sleeping = self._state == "SLEEPING"
+        now = time.time()
+
+        # core scale — gentle idle jitter, dramatic jump while speaking
+        if now - self._last_t > (0.12 if speaking else 0.5):
+            if speaking:
+                self._tgt_scale = random.uniform(1.06, 1.14)
+            elif sleeping:
+                self._tgt_scale = random.uniform(0.998, 1.002)
+            else:
+                self._tgt_scale = random.uniform(1.001, 1.008)
+            self._last_t = now
+        sp = 0.38 if speaking else 0.15
+        self._scale += (self._tgt_scale - self._scale) * sp
+
+        # three counter-rotating ring layers
+        if speaking:
+            speeds = [1.3, -0.9, 2.0]
+        elif sleeping:
+            speeds = [0.14, -0.09, 0.22]   # ~0.25x normal — barely drifting
+        else:
+            speeds = [0.55, -0.35, 0.9]
+        for i, spd in enumerate(speeds):
+            self._rings[i] = (self._rings[i] + spd) % 360
+
+        # breathing halo — smooth sine, no jitter needed at this size
+        self._breath = (self._breath + (0.14 if speaking else 0.05 if sleeping else 0.07)) % (2 * math.pi)
+
+        # gentle idle core pulse (always running, subtle beneath the scale-jump)
+        self._pulse = (self._pulse + 0.06) % (2 * math.pi)
+
+        # expanding pulse rings — spawn at core, fade out by ~26px
+        lim = 26.0
+        adv = 1.7 if speaking else 0.8
+        self._pulses = [r + adv for r in self._pulses if r + adv < lim]
+        if len(self._pulses) < 2 and random.random() < (0.07 if speaking else 0.015):
+            self._pulses.append(0.0)
+
+        self.update()
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
         cx, cy = W / 2, H / 2
-
-        # rotating ring — 4 arc segments with gaps
-        pen = QPen(qcol(C.PRI, 165), 2)   # ~65% alpha
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        ring_rect = QRectF(4, 4, W - 8, H - 8)
-        span = 60 * 16   # 60° segments, Qt angles are 1/16th-degree units
-        for i in range(4):
-            start = int((self._angle + i * 90) * 16)
-            p.drawArc(ring_rect, start, span)
-
-        # pulsing glow core
-        pulse_scale = 0.85 + 0.15 * math.sin(self._pulse)
-        radius = 10.0 * pulse_scale
         core = self._core_color()
+
+        # ponytail: no particles/scanner-arcs/grid/face here — the extra
+        # HudCanvas layers read as noise at 56px, so this stays ring+core+halo.
+
+        speaking = self._state == "SPEAKING"
+        sleeping = self._state == "SLEEPING"
+        halo_base, halo_amp = ((14.0, 10.0) if speaking else
+                                (4.0, 2.0) if sleeping else (8.0, 4.0))
+        halo = halo_base + halo_amp * (0.5 + 0.5 * math.sin(self._breath))
+
+        # breathing halo glow — tinted with the state colour
+        for i in range(6):
+            r   = 11.0 * (1.8 - i * 0.14)
+            frc = 1.0 - i / 6
+            a   = max(0, min(255, int(halo * 6 * frc)))
+            glow_col = QColor(core); glow_col.setAlpha(a)
+            p.setPen(QPen(glow_col, 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+
+        # expanding pulse rings
+        for pr in self._pulses:
+            a = max(0, int(200 * (1.0 - pr / 26.0)))
+            pulse_col = QColor(core); pulse_col.setAlpha(a)
+            p.setPen(QPen(pulse_col, 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), pr, pr)
+
+        # three counter-rotating arc-ring layers
+        for idx, (radius, w_r, arc_l, gap) in enumerate(
+            [(26.0, 2.0, 60, 30), (22.0, 1.5, 70, 50), (18.0, 1.0, 40, 50)]
+        ):
+            base  = self._rings[idx]
+            a_val = max(40, min(255, int(halo * (9 - idx * 2))))
+            ring_col = QColor(core); ring_col.setAlpha(a_val)
+            pen = QPen(ring_col, w_r)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+            angle = base
+            while angle < base + 360:
+                p.drawArc(rect, int(angle * 16), int(arc_l * 16))
+                angle += arc_l + gap
+
+        # pulsing glow core — gentle sine at idle, dramatic jump while speaking
+        pulse_scale = 0.85 + 0.15 * math.sin(self._pulse)
+        radius = 8.0 * pulse_scale * self._scale
 
         glow = QRadialGradient(QPointF(cx, cy), radius * 1.7)
         bright = QColor(core); bright.setAlpha(230)
@@ -3541,20 +3731,108 @@ class MiniOrb(QWidget):
         p.drawEllipse(QPointF(cx, cy), radius, radius)
 
 
+_TASKS_MD = Path.home() / ".claude" / "tasks" / "TASKS.md"
+_tasks_cache: tuple[float, tuple[int, int, int]] | None = None
+
+
+def _chronos_counts() -> tuple[int, int, int] | None:
+    """(dev, gen, todo) from the Chronos index, or None if unreadable.
+
+    dev/gen = table rows (lines starting "| [") inside their "## Active — …"
+    sections; todo = "- [ ]" occurrences across the whole file. Mirrors the
+    counting in main.py's _read_chronos_tasks / the task briefing.
+    """
+    global _tasks_cache
+    try:
+        mtime = _TASKS_MD.stat().st_mtime
+        if _tasks_cache and _tasks_cache[0] == mtime:
+            return _tasks_cache[1]
+        text = _TASKS_MD.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    def _rows(section: str) -> int:
+        start = text.find(section)
+        if start == -1:
+            return 0
+        end = text.find("\n## ", start + 1)
+        chunk = text[start:end if end != -1 else len(text)]
+        return sum(1 for ln in chunk.splitlines() if ln.startswith("| ["))
+
+    counts = (_rows("## Active — Dev Tasks"),
+              _rows("## Active — General Tasks"),
+              text.count("- [ ]"))
+    _tasks_cache = (mtime, counts)
+    return counts
+
+
+_recent_cache: tuple[float, tuple[str, str] | None] | None = None
+
+
+def _chronos_recent() -> tuple[str, str] | None:
+    """(task_label, resume_at) for the most-recently-touched row across both
+    "## Active — Dev Tasks" and "## Active — General Tasks" tables.
+
+    Both tables share the same trailing two columns despite different second
+    columns (Dev: Task | Branch | Last Touched | Resume At; General: Task |
+    Due | Last Touched | Resume At) — column 0 is the task label, column -2
+    is the Last Touched date (YYYY-MM-DD, lexically comparable), column -1
+    (rejoined in case Resume At itself contains "|") is Resume At. Same
+    mtime-cache pattern as _chronos_counts, separate cache since the return
+    shape differs.
+    """
+    global _recent_cache
+    try:
+        mtime = _TASKS_MD.stat().st_mtime
+        if _recent_cache and _recent_cache[0] == mtime:
+            return _recent_cache[1]
+        text = _TASKS_MD.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    def _section_rows(section: str) -> list[tuple[str, str, str]]:
+        start = text.find(section)
+        if start == -1:
+            return []
+        end = text.find("\n## ", start + 1)
+        chunk = text[start:end if end != -1 else len(text)]
+        rows = []
+        for ln in chunk.splitlines():
+            if not ln.startswith("| ["):
+                continue
+            cols = [c.strip() for c in ln.strip().strip("|").split("|")]
+            if len(cols) < 4:
+                continue
+            task, last_touched = cols[0], cols[2]
+            resume_at = "|".join(cols[3:]).strip()
+            rows.append((task, last_touched, resume_at))
+        return rows
+
+    best = None  # (last_touched, task, resume_at)
+    for section in ("## Active — Dev Tasks", "## Active — General Tasks"):
+        for task, last_touched, resume_at in _section_rows(section):
+            if best is None or last_touched > best[0]:
+                best = (last_touched, task, resume_at)
+
+    result = (best[1], best[2]) if best else None
+    _recent_cache = (mtime, result)
+    return result
+
+
 class WidgetCard(QWidget):
     """Floating always-on-top compact status card for widget mode (variant B).
 
-    Frameless, translucent glass panel: orb + name/state header, CPU/RAM/DISK
-    metric tiles, and a last-line strip. Draggable (position persisted via
-    `save_widget_pos`); double-click emits `expand_requested` for phase 4 to
-    wire up. Does not own its `_SysMetrics` — it is handed one and polls it.
+    Frameless, translucent glass panel: orb + name/state header, DEV/GEN/TODO
+    Chronos task-count tiles, and a last-line strip. Draggable (position
+    persisted via `save_widget_pos`); double-click emits `expand_requested`
+    for phase 4 to wire up. Polls `_chronos_counts()` directly — owns no
+    external metrics object.
     """
 
     expand_requested = pyqtSignal()
 
     _CARD_W = 264
     _MARGIN = 24
-    _THRESH = 90.0
 
     _STATE_COLORS = {
         "LISTENING": C.GREEN,
@@ -3562,9 +3840,8 @@ class WidgetCard(QWidget):
         "SLEEPING":  C.TEXT_DIM,
     }
 
-    def __init__(self, metrics, name="J.A.R.V.I.S.", parent=None):
+    def __init__(self, name="J.A.R.V.I.S.", parent=None):
         super().__init__(parent)
-        self._metrics = metrics
         self._drag_offset: QPointF | None = None
 
         self.setWindowFlags(
@@ -3605,15 +3882,15 @@ class WidgetCard(QWidget):
         header.addLayout(name_col, 1)
         root.addLayout(header)
 
-        # ── metric tiles: CPU / RAM / DISK ──────────────────────────────
+        # ── task tiles: DEV / GEN / TODO ─────────────────────────────────
         tiles = QHBoxLayout()
         tiles.setSpacing(8)
-        self._tile_cpu,  self._val_cpu  = self._make_tile("CPU")
-        self._tile_ram,  self._val_ram  = self._make_tile("RAM")
-        self._tile_disk, self._val_disk = self._make_tile("DISK")
-        tiles.addWidget(self._tile_cpu)
-        tiles.addWidget(self._tile_ram)
-        tiles.addWidget(self._tile_disk)
+        self._tile_dev,  self._val_dev  = self._make_tile("DEV")
+        self._tile_gen,  self._val_gen  = self._make_tile("GEN")
+        self._tile_todo, self._val_todo = self._make_tile("TODO")
+        tiles.addWidget(self._tile_dev)
+        tiles.addWidget(self._tile_gen)
+        tiles.addWidget(self._tile_todo)
         root.addLayout(tiles)
 
         # ── last line ────────────────────────────────────────────────────
@@ -3628,11 +3905,11 @@ class WidgetCard(QWidget):
         self._last_line.setStyleSheet("color: #6d93a6; background: transparent;")
         root.addWidget(self._last_line)
 
-        # ── metrics polling ──────────────────────────────────────────────
-        self._metric_tmr = QTimer(self)
-        self._metric_tmr.timeout.connect(self._refresh_metrics)
-        self._metric_tmr.start(2000)
-        self._refresh_metrics()
+        # ── task-count polling ────────────────────────────────────────────
+        self._task_tmr = QTimer(self)
+        self._task_tmr.timeout.connect(self._refresh_tasks)
+        self._task_tmr.start(30000)
+        self._refresh_tasks()
 
         self._restore_position()
 
@@ -3675,21 +3952,18 @@ class WidgetCard(QWidget):
         y = screen.y() + self._MARGIN
         self.move(x, y)
 
-    # ── metrics ──────────────────────────────────────────────────────────
-    def _refresh_metrics(self):
-        snap = self._metrics.snapshot()
-        self._set_tile(self._tile_cpu,  self._val_cpu,  snap.get("cpu", 0.0))
-        self._set_tile(self._tile_ram,  self._val_ram,  snap.get("mem", 0.0))
-        self._set_tile(self._tile_disk, self._val_disk, snap.get("disk_percent", 0.0))
-
-    def _set_tile(self, tile: QWidget, val_lbl: QLabel, pct: float):
-        val_lbl.setText(f"{pct:.0f}%")
-        if pct >= self._THRESH:
-            tile.setStyleSheet("background: rgba(255,107,0,0.09); border-radius: 9px;")
-            val_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent;")
-        else:
-            tile.setStyleSheet("background: rgba(0,212,255,0.06); border-radius: 9px;")
-            val_lbl.setStyleSheet("color: #d4ecf6; background: transparent;")
+    # ── tasks ──────────────────────────────────────────────────────────────
+    def _refresh_tasks(self):
+        counts = _chronos_counts()
+        if counts is None:
+            self._val_dev.setText("--")
+            self._val_gen.setText("--")
+            self._val_todo.setText("--")
+            return
+        dev, gen, todo = counts
+        self._val_dev.setText(str(dev))
+        self._val_gen.setText(str(gen))
+        self._val_todo.setText(str(todo))
 
     # ── public slots (phase-4 wiring) ───────────────────────────────────
     def set_state(self, state: str):
