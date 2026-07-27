@@ -738,6 +738,15 @@ class JarvisLive:
             category = args.get("category", "notes")
             key      = args.get("key", "")
             value    = args.get("value", "")
+
+            # Guard: block language saves — pinned to English at system level
+            if "language" in str(key).lower():
+                print(f"[Memory] 🚫 blocked language save: {key} = {value}")
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": "Language is pinned to English at system level — not saved.", "silent": True}
+                )
+
             if key and value:
                 update_memory({category: {key: {"value": value}}})
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
