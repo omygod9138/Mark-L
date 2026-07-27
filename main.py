@@ -51,6 +51,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.ask_claude        import bridge as claude_bridge
 from actions.herdr_monitor     import HerdrWatcher, HerdrMissing
+from actions.claude_relay      import ClaudeRelay
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
@@ -59,6 +60,7 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
+from actions.audio_device      import start as _start_audio_watcher, current_output
 from memory.config_manager     import get_brief_enabled, get_persona, get_voice, PERSONAS
 
 
@@ -612,9 +614,13 @@ class JarvisLive:
         self._briefing_sent    = False          # morning briefing fires once per process
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._herdr_watcher    = HerdrWatcher()   # herdr blocked-workspace announcer
+        self._claude_relay     = ClaudeRelay()    # Claude Code replies, focus-gated
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._audio_reload_req = False   # CoreAudio saw a device change; reload when idle
+        self._audio_pause      = False   # streams must close so PortAudio can be reinitialised
+        self._audio_closed     = 0       # how many of the 2 streams have closed for a reload
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -1015,20 +1021,38 @@ class JarvisLive:
                     {"data": data, "mime_type": "audio/pcm"}
                 )
 
-        try:
-            with sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=CHUNK_SIZE,
-                callback=callback,
-            ):
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
-            raise
+        # Outer loop lets a device reload close + reopen the stream without
+        # tearing down this task — see main.py's _run_audio_device_reload.
+        while True:
+            # ponytail: captured, not re-read — the reload coordinator can clear
+            # self._audio_pause (abort path) before we get back here, which would
+            # make a reload look like a real exit and kill this task silently.
+            paused = False
+            try:
+                with sd.InputStream(
+                    samplerate=SEND_SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype="int16",
+                    blocksize=CHUNK_SIZE,
+                    callback=callback,
+                ):
+                    print("[JARVIS] 🎤 Mic stream open")
+                    while True:
+                        if self._audio_pause:
+                            paused = True
+                            break   # `with` exit below closes the stream
+                        await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"[JARVIS] ❌ Mic: {e}")
+                raise
+
+            if not paused:
+                return   # pragma: no cover — only reachable on unexpected non-pause exit
+
+            self._audio_closed += 1   # stream is now closed
+            while self._audio_pause:
+                await asyncio.sleep(0.05)
+            # loop back around and reopen
 
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
@@ -1149,54 +1173,73 @@ class JarvisLive:
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
 
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
-        stream.start()
+        # Outer loop lets a device reload close + reopen the stream without
+        # tearing down this task — see main.py's _run_audio_device_reload.
+        while True:
+            # ponytail: captured, not re-read — the reload coordinator can clear
+            # self._audio_pause (abort path) before we get back here, which would
+            # make a reload look like a real exit and kill this task silently.
+            paused = False
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+            )
+            stream.start()
 
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        self.audio_in_queue.get(),
-                        timeout=0.1
-                    )
-                except asyncio.TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                    ):
-                        self.set_speaking(False)
-                        self._turn_done_event.clear()
-                    continue
-
-                self.set_speaking(True)
-
-                # Batch all immediately-available chunks into one write to reduce
-                # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
-                batch = bytearray(chunk)
-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
-                    try:
-                        batch.extend(self.audio_in_queue.get_nowait())
-                    except asyncio.QueueEmpty:
+            try:
+                while True:
+                    if self._audio_pause:
+                        paused = True
                         break
 
-                try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
-                except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
-        except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
-        finally:
-            self.set_speaking(False)
-            stream.stop()
-            stream.close()
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self.audio_in_queue.get(),
+                            timeout=0.1
+                        )
+                    except asyncio.TimeoutError:
+                        if (
+                            self._turn_done_event
+                            and self._turn_done_event.is_set()
+                            and self.audio_in_queue.empty()
+                        ):
+                            self.set_speaking(False)
+                            self._turn_done_event.clear()
+                        continue
+
+                    self.set_speaking(True)
+
+                    # Batch all immediately-available chunks into one write to reduce
+                    # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
+                    # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                    batch = bytearray(chunk)
+                    while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+                        try:
+                            batch.extend(self.audio_in_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+
+                    try:
+                        await asyncio.to_thread(stream.write, bytes(batch))
+                    except (RuntimeError, asyncio.CancelledError):
+                        break   # executor shutting down — exit cleanly
+            except Exception as e:
+                print(f"[JARVIS] ❌ Play: {e}")
+                raise
+            finally:
+                self.set_speaking(False)
+                stream.stop()
+                stream.close()
+
+            if not paused:
+                return   # executor shutdown / real exit path above — not a reload
+
+            self._audio_closed += 1   # stream is now closed
+            while self._audio_pause:
+                await asyncio.sleep(0.05)
+            # loop back around and reopen
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -1465,6 +1508,55 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Herdr] ⚠️ Could not send alert: {e}")
 
+    # ── Claude Code relay ───────────────────────────────────────────────────────
+
+    async def _run_claude_relay(self) -> None:
+        """Background task: voice Claude Code replies from the focused pane only.
+
+        Unfocused panes queue as reminders and are released when the user turns
+        to them — several agents finishing at once must never talk over each
+        other.
+        """
+        while True:
+            await asyncio.sleep(2)
+            if not self.session:
+                continue
+            # Same courtesy as the herdr announcer: never cut into a live turn
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or (time.monotonic() - self._last_user_speech) < 6:
+                continue
+            try:
+                reply, reminders = await asyncio.to_thread(self._claude_relay.check)
+            except Exception as e:
+                print(f"[ClaudeRelay] ⚠️ Check failed: {e}")
+                continue
+            try:
+                if reply:
+                    await self.session.send_client_content(
+                        turns={"parts": [{"text":
+                            f"[CLAUDE_RESULT from {reply.get('project', 'a project')}]\n"
+                            f"{reply.get('text', '')}\n\n"
+                            "Summarise what Claude just did in one or two short spoken "
+                            "sentences. Lead with the outcome. No markdown, no file paths, "
+                            "no code."
+                        }]},
+                        turn_complete=True,
+                    )
+                    print(f"[ClaudeRelay] 🗣 Spoke: {reply.get('project')}")
+                elif reminders:
+                    names = ", ".join(dict.fromkeys(reminders))
+                    await self.session.send_client_content(
+                        turns={"parts": [{"text":
+                            f'[QUIET_NOTICE] "{self._address}, {names} finished and is '
+                            f'waiting for you."'
+                        }]},
+                        turn_complete=True,
+                    )
+                    print(f"[ClaudeRelay] 📢 Reminder: {names}")
+            except Exception as e:
+                print(f"[ClaudeRelay] ⚠️ Could not send: {e}")
+
     # ── Background monitor ──────────────────────────────────────────────────────
 
     async def _run_background_monitor(self) -> None:
@@ -1497,6 +1589,63 @@ class JarvisLive:
                     except Exception as e:
                         print(f"[Monitor] ⚠️ Background check error: {e}")
             await asyncio.sleep(1800)     # check every 30 minutes
+
+    # ── Audio device watcher ─────────────────────────────────────────────────────
+
+    def _on_audio_device_changed(self) -> None:
+        """CoreAudio HAL-thread callback — no asyncio here, just a plain flag flip."""
+        self._audio_reload_req = True
+        print("[Audio] 🔄 Default output device changed — reload queued")
+
+    async def _run_audio_device_reload(self) -> None:
+        """Coordinates a PortAudio re-init after CoreAudio reports a default-device change.
+
+        `sd._terminate()`/`sd._initialize()` tear down PortAudio process-wide, so
+        both the mic and playback streams must be fully closed first and reopened
+        after — see `_listen_audio` / `_play_audio`'s outer reload loop.
+        """
+        while True:
+            await asyncio.sleep(0.5)
+            if not self._audio_reload_req:
+                continue
+
+            # Never reload mid-sentence or mid-turn.
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking:
+                continue
+            if not self.audio_in_queue.empty():
+                continue
+
+            self._audio_reload_req = False
+            self._audio_closed     = 0
+            self._audio_pause      = True
+
+            # Wait for both streams to actually close before touching PortAudio.
+            for _ in range(60):   # 60 × 0.05s = 3s
+                if self._audio_closed == 2:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                # ponytail: abort rather than reinit underneath a still-live stream.
+                self._audio_pause = False
+                print("[Audio] ⚠️ Streams didn't close in time — aborting reload")
+                continue
+
+            try:
+                sd._terminate()
+                sd._initialize()
+                sd.default.device = None   # both steps required — verified experimentally
+                name = sd.query_devices(kind="output")["name"]
+                print(f"[Audio] 🔊 Switched to: {name}")
+                try:
+                    self.ui.set_audio_device(*current_output())
+                except Exception as e:
+                    print(f"[Audio] ⚠️ Widget device update failed: {e}")
+            except Exception as e:
+                print(f"[Audio] ⚠️ Reload failed: {e}")
+            finally:
+                self._audio_pause = False   # let both streams reopen regardless
 
     # ── Proactive mode ──────────────────────────────────────────────────────────
 
@@ -1611,6 +1760,18 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
 
+        # Watch for macOS default-output-device changes — registered once for the
+        # whole process, independent of the reconnect loop below.
+        if _start_audio_watcher(self._on_audio_device_changed):
+            print("[Audio] 🎧 Device watcher active")
+        else:
+            print("[Audio] Device watcher unavailable — output is fixed at launch")
+
+        try:
+            self.ui.set_audio_device(*current_output())
+        except Exception as e:
+            print(f"[Audio] ⚠️ Widget device update failed: {e}")
+
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer
@@ -1665,8 +1826,10 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_herdr_monitor())
+                    tg.create_task(self._run_claude_relay())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._run_audio_device_reload())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 

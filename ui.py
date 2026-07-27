@@ -1833,6 +1833,7 @@ class MainWindow(QMainWindow):
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _quick_prompt_sig = pyqtSignal()         # F9 global hotkey → toggle quick-prompt popup
+    _audio_dev_sig  = pyqtSignal(str, str)   # (name, kind) — output device changed
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1867,6 +1868,7 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
         self._widget_card: WidgetCard | None = None
+        self._audio_dev: tuple[str, str] = ("—", "speaker")
         self._widget_mode_active = False
         self._really_quit = False
         self._quick_prompt: QuickPrompt | None = None
@@ -1981,6 +1983,7 @@ class MainWindow(QMainWindow):
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._clipboard_sig.connect(self._show_clipboard_panel)
+        self._audio_dev_sig.connect(self._on_audio_device)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -3210,11 +3213,17 @@ class MainWindow(QMainWindow):
 
     # ── Widget mode ──────────────────────────────────────────────────────────────
 
+    def _on_audio_device(self, name: str, kind: str) -> None:
+        self._audio_dev = (name, kind)
+        if self._widget_card is not None:
+            self._widget_card.set_audio_device(name, kind)
+
     def _enter_widget_mode(self):
         if self._widget_card is None:
             self._widget_card = WidgetCard(self._assistant_name)
             self._widget_card.expand_requested.connect(self._exit_widget_mode)
             self._widget_card.installEventFilter(self)
+            self._widget_card.set_audio_device(*self._audio_dev)
         self._widget_mode_active = True
         self.hide()
         self._widget_card.show()
@@ -3542,6 +3551,10 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def set_audio_device(self, name: str, kind: str) -> None:
+        """Thread-safe: update the widget's output-device row."""
+        self._win._audio_dev_sig.emit(name, kind)
 
     def wait_for_api_key(self):
         while not self._win._ready:
@@ -3893,6 +3906,24 @@ class WidgetCard(QWidget):
         tiles.addWidget(self._tile_todo)
         root.addLayout(tiles)
 
+        # ── output device row ────────────────────────────────────────────
+        audio_row = QHBoxLayout()
+        audio_row.setSpacing(6)
+
+        self._out_icon = QLabel("🔊")
+        self._out_icon.setFont(QFont("Segoe UI", 11))
+        self._out_icon.setStyleSheet("background: transparent;")
+        self._out_icon.setFixedWidth(18)   # icon swap must not shift the name label
+        audio_row.addWidget(self._out_icon)
+
+        self._out_name = QLabel("—")
+        self._out_name.setFont(QFont("Segoe UI", 9))
+        self._out_name.setStyleSheet("color: #6d93a6; background: transparent;")
+        self._out_name.setMaximumWidth(self._CARD_W - 28 - 18 - 6)   # never widen the fixed-width card
+        audio_row.addWidget(self._out_name, 1)
+
+        root.addLayout(audio_row)
+
         # ── last line ────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -3981,6 +4012,15 @@ class WidgetCard(QWidget):
         # ~2-line budget the card has room for before truncating.
         elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, avail_w * 2)
         self._last_line.setText(elided)
+
+    def set_audio_device(self, name: str, kind: str) -> None:
+        """Update the output-device row. kind: "headphones" | "speaker"."""
+        self._out_icon.setText("🎧" if kind == "headphones" else "🔊")
+        fm = QFontMetrics(self._out_name.font())
+        elided = fm.elidedText(name or "—", Qt.TextElideMode.ElideRight, self._out_name.maximumWidth())
+        self._out_name.setText(elided)
+        self._out_icon.setToolTip(name or "")
+        self._out_name.setToolTip(name or "")
 
     # ── drag-to-move ─────────────────────────────────────────────────────
     def mousePressEvent(self, e):
