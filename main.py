@@ -722,7 +722,8 @@ class JarvisLive:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
                         voice_name="Charon"
                     )
-                )
+                ),
+                language_code="en-US",
             ),
         )
 
