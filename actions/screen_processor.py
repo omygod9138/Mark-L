@@ -81,16 +81,19 @@ _IMG_MAX_W = 1280
 _IMG_MAX_H = 720
 _JPEG_Q    = 82
 
-_SYSTEM_PROMPT = (
-    "You are JARVIS, Tony Stark's AI assistant. "
-    "You are given an image from either the user's screen or their webcam. "
-    "Analyze what you see with detail and intelligence. "
-    "Describe objects, text, people, components, and their context clearly. "
-    "For technical questions (circuits, code, hardware) give specific, expert answers. "
-    "Be concise — 2-4 sentences — unless the question demands more detail. "
-    "Speak directly to the user ('I can see...', 'You have...'). "
-    "Address the user as 'sir' depending on the language they used."
-)
+def _system_prompt() -> str:
+    from memory.config_manager import get_display_name, get_address
+    return (
+        f"You are {get_display_name()}, the user's AI assistant. "
+        "You are given an image from either the user's screen or their webcam. "
+        "Analyze what you see with detail and intelligence. "
+        "Describe objects, text, people, components, and their context clearly. "
+        "For technical questions (circuits, code, hardware) give specific, expert answers. "
+        "Be concise — 2-4 sentences — unless the question demands more detail. "
+        "Speak directly to the user ('I can see...', 'You have...'). "
+        f"Address the user as '{get_address()}'. "
+        "Always reply in English."
+    )
 
 
 def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]:
@@ -258,14 +261,16 @@ class _VisionSession:
             api_key=_get_api_key(),
             http_options={"api_version": "v1beta"},
         )
+        from memory.config_manager import get_voice
+        _voice = get_voice()
         config = gtypes.LiveConnectConfig(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
-            system_instruction=_SYSTEM_PROMPT,
+            system_instruction=_system_prompt(),
             speech_config=gtypes.SpeechConfig(
                 voice_config=gtypes.VoiceConfig(
                     prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=_voice
                     )
                 )
             ),

@@ -54,12 +54,12 @@ from actions.herdr_monitor     import HerdrWatcher, HerdrMissing
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
-from actions.proactive         import ProactiveEngine
+from actions.proactive         import ProactiveEngine, briefed_today, mark_briefed_today, is_workday
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled, get_persona, get_voice_override
+from memory.config_manager     import get_brief_enabled, get_persona, get_voice, PERSONAS
 
 
 def get_base_dir():
@@ -71,10 +71,6 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-PERSONAS = {
-    "jarvis": {"prompt": BASE_DIR / "core" / "personas" / "jarvis.txt", "voice": "Charon", "name": "JARVIS", "address": "sir"},
-    "friday": {"prompt": BASE_DIR / "core" / "personas" / "friday.txt", "voice": "Aoede",  "name": "FRIDAY", "address": "Boss"},
-}
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -446,6 +442,16 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "daily_briefing",
+        "description": (
+            "Read the user's Chronos task tracker and deliver a task briefing on demand. "
+            "Use whenever the user asks to be briefed, asks what is on today, asks about "
+            "their tasks or backlog, or says anything like 'brief me' / 'what am I working on'. "
+            "The scheduled 09:00 briefing is automatic — this is for every other time."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
         "name": "ask_claude",
         "description": (
             "Delegates a task to Claude, a powerful coding and reasoning agent with "
@@ -584,6 +590,7 @@ class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
         self._asst_name     = "JARVIS"   # updated each session from config
+        self._address       = "sir"      # resolved per session from config/persona
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -674,7 +681,7 @@ class JarvisLive:
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
+        self.speak(f"{self._address}, {tool_name} encountered an error. {short}")
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -698,8 +705,7 @@ class JarvisLive:
             self._asst_name = _persona["name"]
 
         # Voice override: config wins if non-empty, else use persona's voice
-        _voice_override = get_voice_override()
-        _resolved_voice = _voice_override if _voice_override else _persona["voice"]
+        _resolved_voice = get_voice()
         print(f"[JARVIS] 🎙️ Persona '{_persona_key}' voice: {_resolved_voice}")
 
         memory     = load_memory()
@@ -713,6 +719,10 @@ class JarvisLive:
             f"Right now it is: {time_str}\n"
             f"Use this to calculate exact times for reminders.\n\n"
         )
+
+        # Background announcements (herdr, alerts) need the same address the
+        # system prompt sets — otherwise they greet a FRIDAY user as "Sir".
+        self._address = _user_name or _persona["address"]
 
         # Identity injection — overrides any hardcoded name in prompt.txt
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
@@ -906,6 +916,15 @@ class JarvisLive:
                     result = ("Monitoring: " + ", ".join(topics)) if topics else "No topics are being monitored."
                 else:
                     result = "Specify action (add/remove/list) and a topic."
+
+            elif name == "daily_briefing":
+                tasks_md = await asyncio.to_thread(self._read_chronos_tasks)
+                result = (
+                    "The user's task tracker index:\n" + tasks_md + "\n\n"
+                    "Say how many dev and general tasks are active, then name the most "
+                    "recently touched task — its project tag and short title — and give its "
+                    "'Resume At' hint in plain words. Do not read the whole list aloud."
+                ) if tasks_md else "The task tracker index could not be read."
 
             elif name == "ask_claude":
                 question = args.get("question", "").strip()
@@ -1258,6 +1277,11 @@ class JarvisLive:
         )
         self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
 
+        # The day is briefed — the 09:00 routine slot must not repeat it, and a
+        # relaunch this afternoon must start silent.
+        await asyncio.to_thread(mark_briefed_today)
+        self._proactive.skip_today("morning_tasks")
+
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
         async def _deliver_news():
             try:
@@ -1432,7 +1456,7 @@ class JarvisLive:
             try:
                 await self.session.send_client_content(
                     turns={"parts": [{"text":
-                        f'[QUIET_NOTICE] "Sir, {names} needs your '
+                        f'[QUIET_NOTICE] "{self._address}, {names} needs your '
                         f'confirmation."'
                     }]},
                     turn_complete=True,
@@ -1493,7 +1517,9 @@ class JarvisLive:
             if speaking:
                 continue
 
-            if not self._proactive.should_trigger(self._last_user_speech):
+            slot = self._proactive.due_slot()
+
+            if slot is None and not self._proactive.should_trigger(self._last_user_speech):
                 continue
 
             self._proactive.mark_triggered()
@@ -1502,16 +1528,27 @@ class JarvisLive:
                 memory       = await asyncio.to_thread(load_memory)
                 monitors     = await asyncio.to_thread(list_monitors)
                 recent_turns = self._session_log[-8:] if self._session_log else []
+                extra = ""
+                if slot and slot.get("needs_tasks"):
+                    tasks_md = await asyncio.to_thread(self._read_chronos_tasks)
+                    if tasks_md:
+                        extra = f"\nThe user's task tracker index:\n{tasks_md}"
                 prompt = self._proactive.build_prompt(
-                    memory       = memory,
-                    monitors     = monitors or None,
-                    recent_turns = recent_turns or None,
+                    memory        = memory,
+                    monitors      = monitors or None,
+                    recent_turns  = recent_turns or None,
+                    slot          = slot,
+                    extra_context = extra,
                 )
                 await self.session.send_client_content(
                     turns={"parts": [{"text": prompt}]},
                     turn_complete=True,
                 )
-                self.ui.write_log("SYS: Proactive check-in.")
+                if slot and slot["slug"] == "morning_tasks":
+                    await asyncio.to_thread(mark_briefed_today)
+                self.ui.write_log(
+                    f"SYS: Routine check-in ({slot['slug']})." if slot else "SYS: Proactive check-in."
+                )
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
@@ -1633,8 +1670,11 @@ class JarvisLive:
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
-                    # Morning briefing — fires once per process launch (if enabled)
-                    if not self._briefing_sent and get_brief_enabled():
+                    # Morning briefing — once per calendar day, weekdays only.
+                    # Persisted, so relaunching later in the day starts silent;
+                    # `daily_briefing` covers on-demand asks after that.
+                    if (not self._briefing_sent and get_brief_enabled()
+                            and is_workday() and not briefed_today()):
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 

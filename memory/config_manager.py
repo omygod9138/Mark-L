@@ -84,10 +84,31 @@ def get_persona() -> str:
     return load_api_keys().get("persona", "jarvis") or "jarvis"
 
 
-# Display-only names for personas. Mirrors the "name" field of PERSONAS in
-# main.py — kept minimal here (not the full dict) so ui.py never has to
-# import main.py just to know what to print on screen.
-_PERSONA_NAMES = {"jarvis": "J.A.R.V.I.S.", "friday": "F.R.I.D.A.Y."}
+# Single source of truth for persona data. Everything persona-shaped reads
+# from here — main.py's session config, the UI's display name, and the
+# vision subsystem's voice. Adding a persona means adding one row.
+PERSONAS = {
+    "jarvis": {
+        "prompt":  BASE_DIR / "core" / "personas" / "jarvis.txt",
+        "voice":   "Charon",
+        "name":    "JARVIS",          # plain name, used as the session identity
+        "display": "J.A.R.V.I.S.",    # stylised, used in the UI
+        "address": "sir",
+    },
+    "friday": {
+        "prompt":  BASE_DIR / "core" / "personas" / "friday.txt",
+        "voice":   "Aoede",
+        "name":    "FRIDAY",
+        "display": "F.R.I.D.A.Y.",
+        "address": "Boss",
+    },
+}
+DEFAULT_PERSONA = "jarvis"
+
+
+def get_persona_data() -> dict:
+    """The active persona's row, falling back to the default on an unknown key."""
+    return PERSONAS.get(get_persona(), PERSONAS[DEFAULT_PERSONA])
 
 
 def get_display_name() -> str:
@@ -98,9 +119,15 @@ def get_display_name() -> str:
     precedence (existing behavior), falling back to "JARVIS".
     """
     persona = get_persona()
-    if persona != "jarvis":
-        return _PERSONA_NAMES.get(persona, _PERSONA_NAMES["jarvis"])
+    if persona != DEFAULT_PERSONA:
+        return PERSONAS.get(persona, PERSONAS[DEFAULT_PERSONA])["display"]
     return get_assistant_name()
+
+
+def get_address() -> str:
+    """How the assistant addresses the user: the configured user_name if set,
+    otherwise the active persona's default form of address."""
+    return (load_api_keys().get("user_name") or "").strip() or get_persona_data()["address"]
 
 
 def save_brief_enabled(enabled: bool) -> None:
@@ -156,3 +183,8 @@ def save_widget_pos(x: int, y: int) -> None:
 def get_voice_override() -> str:
     """Return the configured voice override, or '' if not set."""
     return load_api_keys().get("voice", "") or ""
+
+
+def get_voice() -> str:
+    """Resolved TTS voice: the `voice` config override if set, else the persona's."""
+    return get_voice_override() or get_persona_data()["voice"]

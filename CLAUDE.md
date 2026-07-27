@@ -56,8 +56,9 @@ Session summaries are **consume-once**: `save_session_summary` writes on disconn
 
 ## Gotchas
 
-- **There is no `.gitignore`.** `config/api_keys.json` holds the Gemini key and `memory/long_term.json` holds personal data. Neither is tracked today — keep it that way; add them to a `.gitignore` before any commit that could sweep them in.
+- **`.gitignore` covers the three untracked personal files** — `config/api_keys.json` (Gemini key, persona choice), `memory/long_term.json` (personal data), `memory/routine_state.json` (daily routine/briefing state). Any new file holding secrets or personal data must be added there in the same commit that introduces it.
 - `main.py` passes `"face.png"`, which is not in the repo; `_load_face` swallows the failure and the HUD runs without it.
 - `requirements.txt` is deliberately incomplete for OS-specific extras — a `ModuleNotFoundError` at runtime is expected behaviour, install the named package.
-- Turkish and English are both first-class: user-facing strings, prompt rules, and even some log lines are bilingual. Preserve the language-mirroring behaviour (respond in the user's language; `sir` / `efendim` never mixed).
+- **Spoken output is pinned to English** — `core/prompt.txt` TOOL ROUTING and `SpeechConfig` both enforce it, and `save_memory` blocks any memory key containing "language" because stored language facts previously overrode the pin. Turkish is fully retired from code — no `efendim` remains anywhere outside `readme.md`, which is stale. Do not "restore" language mirroring.
+- **Form of address is persona-driven, never hardcoded** — "sir" for JARVIS, "Boss" for FRIDAY, overridden by a `user_name` in config. `main.py` resolves it into `self._address`; `memory/config_manager.py` exposes `get_address()` / `get_display_name()` for action modules. Action modules that return spoken text should omit the vocative entirely and let the main model add it.
 - Crypto/financial/trading topics are blocked at code level in `actions/background_monitor.py` regardless of what the user asks. Intentional.

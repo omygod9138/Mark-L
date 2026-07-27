@@ -1,6 +1,7 @@
 # Secrets & personal data
 config/api_keys.json
 memory/long_term.json
+memory/routine_state.json
 
 # Environment & caches
 .venv/
