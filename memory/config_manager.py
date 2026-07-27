@@ -79,6 +79,30 @@ def get_brief_enabled() -> bool:
     return load_api_keys().get("morning_brief_enabled", True)
 
 
+def get_persona() -> str:
+    """Return the configured persona key, or 'jarvis' if not set."""
+    return load_api_keys().get("persona", "jarvis") or "jarvis"
+
+
+# Display-only names for personas. Mirrors the "name" field of PERSONAS in
+# main.py — kept minimal here (not the full dict) so ui.py never has to
+# import main.py just to know what to print on screen.
+_PERSONA_NAMES = {"jarvis": "J.A.R.V.I.S.", "friday": "F.R.I.D.A.Y."}
+
+
+def get_display_name() -> str:
+    """Return the assistant name to show in the UI for the active persona.
+
+    Non-jarvis personas always show their stylised persona name. For the
+    jarvis persona, a user-configured custom assistant_name takes
+    precedence (existing behavior), falling back to "JARVIS".
+    """
+    persona = get_persona()
+    if persona != "jarvis":
+        return _PERSONA_NAMES.get(persona, _PERSONA_NAMES["jarvis"])
+    return get_assistant_name()
+
+
 def save_brief_enabled(enabled: bool) -> None:
     ensure_config_dir()
     data: dict = {}
@@ -127,3 +151,8 @@ def save_widget_pos(x: int, y: int) -> None:
             data = {}
     data["widget_pos"] = [x, y]
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_voice_override() -> str:
+    """Return the configured voice override, or '' if not set."""
+    return load_api_keys().get("voice", "") or ""

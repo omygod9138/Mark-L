@@ -1747,7 +1747,8 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        from memory.config_manager import get_display_name
+        self._assistant_name: str = get_display_name()
         _display = self._assistant_name.upper()
 
         # Kayıtlı UI rengini panel/stylesheet'ler kurulmadan ÖNCE uygula
@@ -2585,6 +2586,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
+        self._log._ai_name_lc = self._assistant_name.lower().replace(".", "")
         lay.addWidget(self._log, stretch=1)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -3132,7 +3134,7 @@ class MainWindow(QMainWindow):
 
     def _enter_widget_mode(self):
         if self._widget_card is None:
-            self._widget_card = WidgetCard(_metrics)
+            self._widget_card = WidgetCard(_metrics, self._assistant_name)
             self._widget_card.expand_requested.connect(self._exit_widget_mode)
             self._widget_card.installEventFilter(self)
         self._widget_mode_active = True
@@ -3213,8 +3215,10 @@ class MainWindow(QMainWindow):
             self._sub_lbl.setText("Just A Rather Very Intelligent System")
         else:
             self._sub_lbl.setText("Personal AI Assistant")
-        self._log._ai_name_lc = self._assistant_name.lower()
+        self._log._ai_name_lc = self._assistant_name.lower().replace(".", "")
         self.hud._assistant_name = display
+        if self._widget_card is not None:
+            self._widget_card._name_lbl.setText(self._assistant_name)
 
         color_changed = False
         if ui_color:
@@ -3318,7 +3322,11 @@ class MainWindow(QMainWindow):
         self._log.append_log(text)
         if self._widget_card is not None:
             tl = text.lower()
-            ai_pfx = f"{self._assistant_name.lower()}:"
+            # Spoken log lines are prefixed with the plain persona name (no
+            # dots, e.g. "friday:"), while the display name can carry
+            # stylised dots (e.g. "F.R.I.D.A.Y."). Strip them so both forms
+            # match.
+            ai_pfx = f"{self._assistant_name.lower().replace('.', '')}:"
             if tl.startswith(ai_pfx) or tl.startswith("jarvis:"):
                 self._widget_card.set_last_line(text)
 
@@ -3356,7 +3364,8 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._assistant_name = _read_full_config().get("assistant_name", "JARVIS") or "JARVIS"
+        from memory.config_manager import get_display_name
+        self._assistant_name = get_display_name()
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
 
 class _RootShim:
@@ -3552,7 +3561,7 @@ class WidgetCard(QWidget):
         "SLEEPING":  C.TEXT_DIM,
     }
 
-    def __init__(self, metrics, parent=None):
+    def __init__(self, metrics, name="J.A.R.V.I.S.", parent=None):
         super().__init__(parent)
         self._metrics = metrics
         self._drag_offset: QPointF | None = None
@@ -3580,7 +3589,7 @@ class WidgetCard(QWidget):
         name_col = QVBoxLayout()
         name_col.setSpacing(2)
 
-        self._name_lbl = QLabel("J.A.R.V.I.S.")
+        self._name_lbl = QLabel(name)
         name_font = QFont("Segoe UI", 13, QFont.Weight.DemiBold)
         name_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
         self._name_lbl.setFont(name_font)

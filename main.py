@@ -59,7 +59,7 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled
+from memory.config_manager     import get_brief_enabled, get_persona, get_voice_override
 
 
 def get_base_dir():
@@ -71,6 +71,10 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+PERSONAS = {
+    "jarvis": {"prompt": BASE_DIR / "core" / "personas" / "jarvis.txt", "voice": "Charon", "name": "JARVIS", "address": "sir"},
+    "friday": {"prompt": BASE_DIR / "core" / "personas" / "friday.txt", "voice": "Aoede",  "name": "FRIDAY", "address": "Boss"},
+}
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
@@ -82,9 +86,12 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _load_system_prompt() -> str:
+def _load_system_prompt(persona: str = "jarvis") -> str:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        persona_path = PERSONAS.get(persona, PERSONAS["jarvis"])["prompt"]
+        persona_txt  = persona_path.read_text(encoding="utf-8")
+        shared_txt   = PROMPT_PATH.read_text(encoding="utf-8")
+        return persona_txt + "\n" + shared_txt
     except Exception:
         return (
             "You are JARVIS, Tony Stark's AI assistant. "
@@ -681,9 +688,23 @@ class JarvisLive:
             self._asst_name = "JARVIS"
             _user_name = ""
 
+        # Persona selection — unknown values fall back to jarvis
+        _persona_key = get_persona()
+        if _persona_key not in PERSONAS:
+            print(f"[JARVIS] ⚠️ Unknown persona '{_persona_key}' — falling back to 'jarvis'")
+            _persona_key = "jarvis"
+        _persona = PERSONAS[_persona_key]
+        if _persona_key != "jarvis":
+            self._asst_name = _persona["name"]
+
+        # Voice override: config wins if non-empty, else use persona's voice
+        _voice_override = get_voice_override()
+        _resolved_voice = _voice_override if _voice_override else _persona["voice"]
+        print(f"[JARVIS] 🎙️ Persona '{_persona_key}' voice: {_resolved_voice}")
+
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
-        sys_prompt = _load_system_prompt()
+        sys_prompt = _load_system_prompt(_persona_key)
 
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
@@ -696,8 +717,7 @@ class JarvisLive:
         # Identity injection — overrides any hardcoded name in prompt.txt
         _addr = (f"ADDRESS: Always call the user '{_user_name}'."
                  if _user_name
-                 else "ADDRESS: When speaking Turkish → always say \"efendim\". "
-                      "When speaking English → say \"sir\". Never mix languages.")
+                 else f"ADDRESS: Always address the user as \"{_persona['address']}\"")
         identity_ctx = (
             f"[IDENTITY]\n"
             f"Your name is {self._asst_name}. "
@@ -720,7 +740,7 @@ class JarvisLive:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
+                        voice_name=_resolved_voice
                     )
                 ),
                 language_code="en-US",
