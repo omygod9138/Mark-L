@@ -720,9 +720,15 @@ class JarvisLive:
 
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
+        tz_name  = str(now.astimezone().tzinfo)
+        utc_off  = now.astimezone().strftime("%z")
+        utc_off  = f"{utc_off[:3]}:{utc_off[3:]}"  # +0800 -> +08:00
         time_ctx = (
             f"[CURRENT DATE & TIME]\n"
-            f"Right now it is: {time_str}\n"
+            f"Right now it is: {time_str} (timezone: {tz_name}, UTC{utc_off})\n"
+            f"This local time is your ONLY clock. If you have any internal sense of the current "
+            f"time, it runs on UTC and is WRONG for the user — always convert to UTC{utc_off} "
+            f"and state times in the user's local timezone only.\n"
             f"Use this to calculate exact times for reminders.\n\n"
         )
 
