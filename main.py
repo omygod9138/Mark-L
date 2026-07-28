@@ -1028,7 +1028,10 @@ class JarvisLive:
                 )
 
         # Outer loop lets a device reload close + reopen the stream without
-        # tearing down this task — see main.py's _run_audio_device_reload.
+        # tearing down this task — see main.py's _run_audio_device_reload. A
+        # mic-open failure (below) also drives this loop, via the same
+        # reload coordinator the CoreAudio device-change listener uses.
+        mic_fail_backoff = 1.0   # grows on repeated open failures; reset on success
         while True:
             # ponytail: captured, not re-read — the reload coordinator can clear
             # self._audio_pause (abort path) before we get back here, which would
@@ -1043,14 +1046,40 @@ class JarvisLive:
                     callback=callback,
                 ):
                     print("[JARVIS] 🎤 Mic stream open")
+                    mic_fail_backoff = 1.0   # reset now the device is good again
                     while True:
                         if self._audio_pause:
                             paused = True
                             break   # `with` exit below closes the stream
                         await asyncio.sleep(0.1)
             except Exception as e:
-                print(f"[JARVIS] ❌ Mic: {e}")
-                raise
+                # PortAudio's device snapshot can go stale in-process after a
+                # network-triggered reconnect (observed: PaErrorCode -9986 /
+                # PaMacCore AUHAL -10851 "Invalid Property Value"). Retrying the
+                # same open just fails again forever — process alive, mic deaf.
+                # Ask the device-reload coordinator (the same one
+                # _on_audio_device_changed uses) to terminate+reinit PortAudio
+                # instead of duplicating that logic here.
+                print(f"[JARVIS] ❌ Mic: {e} — requesting device reload")
+                self._audio_reload_req = True
+
+                # The stream above never opened, so there's nothing for us to
+                # close. The coordinator resets _audio_closed to 0 right
+                # before it flips _audio_pause on (see
+                # _run_audio_device_reload), so we must wait for that flip
+                # before counting ourselves "closed" — bumping early would be
+                # wiped out by the reset and the coordinator would time out
+                # waiting for both streams, aborting the reload.
+                while not self._audio_pause:
+                    await asyncio.sleep(0.1)
+                self._audio_closed += 1
+                while self._audio_pause:
+                    await asyncio.sleep(0.05)
+
+                print(f"[JARVIS] 🎤 Retrying mic open in {mic_fail_backoff:.0f}s...")
+                await asyncio.sleep(mic_fail_backoff)
+                mic_fail_backoff = min(mic_fail_backoff * 2, 30.0)
+                continue   # back to top — try opening the stream again
 
             if not paused:
                 return   # pragma: no cover — only reachable on unexpected non-pause exit
